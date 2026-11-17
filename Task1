@@ -1,0 +1,486 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import (
+    train_test_split,
+    RandomizedSearchCV,
+    StratifiedKFold,
+    cross_val_score,
+    cross_val_predict
+)
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+from xgboost import XGBClassifier
+
+from sklearn.metrics import (
+    roc_auc_score,
+    f1_score,
+    recall_score,
+    precision_score,
+    roc_curve,
+    classification_report,
+    confusion_matrix
+)
+
+from sklearn.inspection import permutation_importance
+
+import warnings
+warnings.filterwarnings('ignore')
+# If df is already loaded, skip this line
+df = pd.read_csv('Customer Churn/WA_Fn-UseC_-Telco-Customer-Churn.csv')
+
+print(df.head())
+print(df.shape)
+print(df.info())
+
+# Separate independent and dependent variables
+X = df.drop('Churn', axis=1).copy()
+y = df['Churn'].copy()
+
+# Encode target if it contains text
+if not pd.api.types.is_numeric_dtype(y):
+    y = y.astype(str).str.strip().map({
+        'No': 0,
+        'Yes': 1
+    })
+
+# Check target
+if y.isna().any() or set(y.unique()) != {0, 1}:
+    raise ValueError("Churn must be encoded as 0 = No and 1 = Yes.")
+
+y = y.astype(int)
+
+print("\nTarget distribution:")
+print(y.value_counts())
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
+
+print("Training shape:", X_train.shape)
+print("Testing shape:", X_test.shape)
+scale_weight = (
+    (y_train == 0).sum() /
+    (y_train == 1).sum()
+)
+
+print("Scale Positive Weight:", scale_weight)
+# Identify numerical and categorical features
+numeric_features = X_train.select_dtypes(
+    include=['number']
+).columns.tolist()
+
+categorical_features = X_train.select_dtypes(
+    exclude=['number']
+).columns.tolist()
+
+# Numerical preprocessing
+numeric_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='median'))
+])
+
+# Categorical preprocessing
+categorical_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore'))
+])
+
+# Combine preprocessing
+preprocessor = ColumnTransformer([
+    ('num', numeric_transformer, numeric_features),
+    ('cat', categorical_transformer, categorical_features)
+])
+lr_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('scaler', StandardScaler(with_mean=False)),
+    ('model', LogisticRegression(
+        class_weight='balanced',
+        max_iter=2000,
+        random_state=42
+    ))
+])
+rf_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('model', RandomForestClassifier(
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=1
+    ))
+])
+xgb_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('model', XGBClassifier(
+        scale_pos_weight=scale_weight,
+        eval_metric='logloss',
+        objective='binary:logistic',
+        random_state=42,
+        n_jobs=1
+    ))
+])
+initial_models = {
+    'Logistic Regression': lr_pipeline,
+    'Random Forest': rf_pipeline,
+    'XGBoost': xgb_pipeline
+}
+
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42
+)
+
+initial_results = []
+
+for name, model in initial_models.items():
+
+    scores = cross_val_score(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring='roc_auc',
+        n_jobs=-1
+    )
+
+    initial_results.append({
+        'Model': name,
+        'Mean ROC-AUC': scores.mean(),
+        'Std ROC-AUC': scores.std()
+    })
+
+initial_df = pd.DataFrame(initial_results)
+
+initial_df = initial_df.sort_values(
+    by='Mean ROC-AUC',
+    ascending=False
+)
+
+print("Initial Model Comparison:")
+print(initial_df)
+
+# Select top two models
+top_two = initial_df.head(2)['Model'].tolist()
+
+print("\nBest two models for tuning:", top_two)
+param_grids = {
+
+    'Logistic Regression': {
+        'model__C': [0.01, 0.1, 1, 10, 100]
+    },
+
+    'Random Forest': {
+        'model__n_estimators': [100, 200, 300, 500],
+        'model__max_depth': [5, 10, 15, None],
+        'model__min_samples_split': [2, 5, 10],
+        'model__min_samples_leaf': [1, 2, 4],
+        'model__max_features': ['sqrt', 'log2']
+    },
+
+    'XGBoost': {
+        'model__n_estimators': [100, 200, 300, 500],
+        'model__max_depth': [3, 4, 5, 7],
+        'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'model__subsample': [0.7, 0.8, 1.0],
+        'model__colsample_bytree': [0.7, 0.8, 1.0],
+        'model__min_child_weight': [1, 3, 5]
+    }
+}
+
+tuned_models = {}
+
+for name in top_two:
+
+    print("\nTuning:", name)
+
+    search = RandomizedSearchCV(
+        estimator=initial_models[name],
+        param_distributions=param_grids[name],
+        n_iter=20,
+        scoring='roc_auc',
+        cv=cv,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1
+    )
+
+    search.fit(X_train, y_train)
+
+    tuned_models[name] = search.best_estimator_
+
+    print("Best Parameters:", search.best_params_)
+    print("Best ROC-AUC:", search.best_score_)
+    models = {}
+
+for name in initial_models:
+
+    if name in tuned_models:
+        models[name] = tuned_models[name]
+
+    else:
+        model = initial_models[name]
+        model.fit(X_train, y_train)
+        models[name] = model
+
+print("All three models are ready.")
+results = []
+
+for name, model in models.items():
+
+    probs = model.predict_proba(X_test)[:, 1]
+
+    predictions = (probs >= 0.5).astype(int)
+
+    auc = roc_auc_score(y_test, probs)
+
+    f1 = f1_score(y_test, predictions)
+
+    results.append({
+        'Model': name,
+        'ROC-AUC': auc,
+        'F1 Score': f1
+    })
+
+comparison_df = pd.DataFrame(results)
+
+comparison_df = comparison_df.sort_values(
+    by='ROC-AUC',
+    ascending=False
+).reset_index(drop=True)
+
+print("\nFINAL MODEL COMPARISON")
+
+print(comparison_df.round(4))
+
+comparison_df.to_csv(
+    'model_comparison.csv',
+    index=False
+)
+plt.figure(figsize=(10, 7))
+
+for name, model in models.items():
+
+    probs = model.predict_proba(X_test)[:, 1]
+
+    fpr, tpr, thresholds = roc_curve(
+        y_test,
+        probs
+    )
+
+    auc = roc_auc_score(y_test, probs)
+
+    plt.plot(
+        fpr,
+        tpr,
+        linewidth=2,
+        label=f'{name} (AUC = {auc:.3f})'
+    )
+
+plt.plot(
+    [0, 1],
+    [0, 1],
+    'k--',
+    label='Random Classifier'
+)
+
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+
+plt.title('ROC Curve Comparison of Three Models')
+
+plt.legend(loc='lower right')
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    'roc_curve_comparison.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+# Select best model using ROC-AUC
+best_model_name = comparison_df.loc[
+    comparison_df['ROC-AUC'].idxmax(),
+    'Model'
+]
+
+best_model = models[best_model_name]
+
+print("Best Model:", best_model_name)
+
+# Generate out-of-fold probabilities from training data
+oof_probs = cross_val_predict(
+    best_model,
+    X_train,
+    y_train,
+    cv=cv,
+    method='predict_proba',
+    n_jobs=-1
+)[:, 1]
+
+# Calculate ROC curve
+fpr_train, tpr_train, thresholds_train = roc_curve(
+    y_train,
+    oof_probs
+)
+
+# Target recall
+target_recall = 0.75
+
+# Find thresholds achieving 75% recall
+valid_thresholds = thresholds_train[
+    tpr_train >= target_recall
+]
+
+if len(valid_thresholds) > 0:
+    best_threshold = valid_thresholds.max()
+else:
+    best_threshold = 0.0
+
+print("Selected Threshold:", best_threshold)
+
+# Training predictions
+train_predictions = (
+    oof_probs >= best_threshold
+).astype(int)
+
+print(
+    "Training Recall:",
+    recall_score(y_train, train_predictions)
+)
+test_probs = best_model.predict_proba(X_test)[:, 1]
+
+final_predictions = (
+    test_probs >= best_threshold
+).astype(int)
+
+print("\nFINAL MODEL PERFORMANCE")
+
+print("ROC-AUC:",
+      roc_auc_score(y_test, test_probs))
+
+print("Precision:",
+      precision_score(
+          y_test,
+          final_predictions,
+          zero_division=0
+      ))
+
+print("Recall:",
+      recall_score(y_test, final_predictions))
+
+print("F1 Score:",
+      f1_score(y_test, final_predictions))
+
+print("\nClassification Report:")
+
+print(classification_report(
+    y_test,
+    final_predictions,
+    zero_division=0
+))
+cm = confusion_matrix(
+    y_test,
+    final_predictions
+)
+
+plt.figure(figsize=(7, 5))
+
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=['No Churn', 'Churn'],
+    yticklabels=['No Churn', 'Churn']
+)
+
+plt.title('Confusion Matrix - Best Model')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+
+plt.tight_layout()
+
+plt.savefig(
+    'confusion_matrix.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+importance_result = permutation_importance(
+    best_model,
+    X_test,
+    y_test,
+    scoring='roc_auc',
+    n_repeats=10,
+    random_state=42,
+    n_jobs=-1
+)
+
+feature_importance = pd.DataFrame({
+    'Feature': X_test.columns,
+    'Importance': importance_result.importances_mean
+})
+
+feature_importance = feature_importance.sort_values(
+    by='Importance',
+    ascending=False
+).reset_index(drop=True)
+
+print("\nTOP 10 IMPORTANT FEATURES")
+
+print(feature_importance.head(10))
+top_features = feature_importance.head(10).sort_values(
+    by='Importance',
+    ascending=True
+)
+
+plt.figure(figsize=(10, 7))
+
+plt.barh(
+    top_features['Feature'],
+    top_features['Importance'],
+    color='teal'
+)
+
+plt.xlabel('Permutation Importance (ROC-AUC decrease)')
+plt.ylabel('Features')
+
+plt.title(
+    f'Top 10 Feature Importance - {best_model_name}'
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    'feature_importance.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+top_5 = feature_importance.head(5)
+
+print("\nTOP 5 IMPORTANT FEATURES")
+
+for i, row in top_5.iterrows():
+
+    print(
+        f"{i+1}. {row['Feature']} "
+        f"- Importance: {row['Importance']:.4f}"
+    )
+    
