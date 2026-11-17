@@ -1,0 +1,70 @@
+import pandas as pd
+import joblib
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    roc_auc_score,
+    f1_score,
+    confusion_matrix,
+    classification_report
+)
+
+# Step 1: Load dataset
+df = pd.read_csv(
+    "Customer Churn/WA_Fn-UseC_-Telco-Customer-Churn.csv"
+)
+
+# Step 2: Remove unnecessary customer ID column
+df = df.drop("customerID", axis=1)
+
+# Step 3: Convert TotalCharges to numeric
+df["TotalCharges"] = pd.to_numeric(
+    df["TotalCharges"], errors="coerce"
+)
+
+df = df.dropna()
+
+# Step 4: Encode categorical columns
+df = pd.get_dummies(df, drop_first=True)
+
+# Step 5: Separate features and target
+X = df.drop("Churn_Yes", axis=1)
+y = df["Churn_Yes"]
+
+# Step 6: Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
+
+# Step 7: Define model
+best_model = RandomForestClassifier(
+    n_estimators=100,
+    random_state=42
+)
+
+# Step 8: Train model
+best_model.fit(X_train, y_train)
+
+# Step 9: Predict
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)[:, 1]
+
+# Step 10: Evaluate
+print("ROC-AUC:", roc_auc_score(y_test, y_prob))
+print("F1 Score:", f1_score(y_test, y_pred))
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+
+print("Classification Report:")
+print(classification_report(y_test, y_pred))
+
+# Step 11: Save model
+joblib.dump(best_model, "customer_churn_model.pkl")
+
+print("Model saved successfully!")
